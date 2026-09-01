@@ -25,6 +25,11 @@ Stdlib only. Usage:
     python3 proxy.py --upstream http://127.0.0.1:8000 \
         --listen 127.0.0.1:8787
 
+    # Debug log (raw request/response bodies and recovery events; streamed
+    # tokens are not logged one record at a time):
+    python3 proxy.py --upstream http://127.0.0.1:8000 \
+        --log-level DEBUG --log-file /tmp/proxy.log
+
 Then point VS Code's Custom Endpoint provider (``chatLanguageModels.json``) at
 ``http://127.0.0.1:8787/v1/chat/completions``.
 """
@@ -254,6 +259,7 @@ def normalize_response_body(body: bytes) -> bytes:
     try:
         payload = json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
+        log.debug("non-stream body is not JSON (%d bytes); passed through", len(body))
         return body
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list):
@@ -271,6 +277,7 @@ def normalize_response_body(body: bytes) -> bytes:
     if total:
         log.info("normalized %d recovered call(s) in a non-stream response", total)
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    log.debug("non-stream response unmodified (%d bytes)", len(body))
     return body
 
 
@@ -479,6 +486,7 @@ def stream_normalizer(gen):
         for out in process_record(raw):
             yield out
     if buf:
+        log.debug("flushing held stream content at end of stream: %r", buf)
         yield _text_event(buf, role=not emitted)
 
 
@@ -545,7 +553,10 @@ def _send_upstream_error(handler, message: str) -> None:
 
 def _read_upstream(resp, timeout: float | None = UPSTREAM_TIMEOUT):
     """Yield body bytes from an upstream response, following chunked framing if present."""
-    if "chunked" in (resp.headers.get("Transfer-Encoding") or "").lower():
+    te = resp.headers.get("Transfer-Encoding")
+    if te:
+        log.debug("upstream response Transfer-Encoding: %s", te)
+    if "chunked" in (te or "").lower():
         fp = resp.fp
         if timeout is not None:
             # fp may be a BufferedReader (over the socket, or over the
@@ -621,6 +632,10 @@ def _send_chunked(handler, gen) -> None:
 def _proxy_request(handler, upstream: str, api_key, timeout: float | None = UPSTREAM_TIMEOUT) -> None:
     method = handler.command
     body = handler._read_body()
+    log.debug("client request: %s %s", method, handler.path)
+    if body:
+        log.debug("client request headers:\n%s", dict(handler.headers))
+        log.debug("client request body:\n%s", body.decode("utf-8", "replace"))
     headers = {
         k: v
         for k, v in handler.headers.items()
@@ -632,10 +647,16 @@ def _proxy_request(handler, upstream: str, api_key, timeout: float | None = UPST
     req = urllib.request.Request(
         upstream + handler.path, data=body, headers=headers, method=method
     )
+    log.debug("forwarding request to %s", req.full_url)
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 - explicit upstream host
     except urllib.error.HTTPError as exc:
         payload = exc.read()
+        log.debug(
+            "upstream error %d:\n%s",
+            exc.code,
+            payload.decode("utf-8", "replace"),
+        )
         handler.send_response(exc.code)
         for k, v in _hop_headers(exc.headers).items():
             handler.send_header(k, v)
@@ -676,8 +697,20 @@ def _proxy_request(handler, upstream: str, api_key, timeout: float | None = UPST
             _send_chunked(handler, gen)
         else:
             payload = resp.read()
+            log.debug(
+                "upstream response %d (%s):\n%s",
+                resp.status,
+                resp.headers.get("Content-Type") or "",
+                payload.decode("utf-8", "replace"),
+            )
             if is_chat and resp.status == 200:
+                raw_payload = payload
                 payload = normalize_response_body(payload)
+                if payload != raw_payload:
+                    log.debug(
+                        "normalized response sent to client:\n%s",
+                        payload.decode("utf-8", "replace"),
+                    )
             handler.send_response(resp.status)
             for k, v in _hop_headers(resp.headers).items():
                 handler.send_header(k, v)
@@ -746,7 +779,9 @@ def _make_handler_class(upstream: str, api_key, timeout: float | None = UPSTREAM
             ``I/O operation on closed file`` on the dead socket.
             """
             self.close_connection = True
-            self.wfile = _QuietWriter()
+            # Deliberate monkey-patch: http.server flushes wfile after do_* returns
+            # even when the socket is dead. Pylance types wfile as BufferedIOBase.
+            self.wfile = _QuietWriter()  # type: ignore[assignment]
 
         def _read_body(self) -> bytes:
             length = int(self.headers.get("Content-Length") or 0)
@@ -799,13 +834,32 @@ def main() -> None:
         default=UPSTREAM_TIMEOUT,
         help="upstream request timeout in seconds (default: %(default)s)",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="log verbosity (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="write the full log to PATH; the console is then limited to WARNING+",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    level = getattr(logging, args.log_level)
+    logging.basicConfig(level=level, format=fmt)
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter(fmt))
+        log.addHandler(file_handler)
+        log.setLevel(min(level, logging.DEBUG))
+        # Keep console output quiet while the full log goes to the file.
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(logging.WARNING)
     try:
         host, port = args.listen.rsplit(":", 1)
         listen_addr = (host or "127.0.0.1", int(port))

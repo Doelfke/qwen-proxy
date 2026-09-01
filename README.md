@@ -24,6 +24,20 @@ python3 proxy.py --upstream http://127.0.0.1:8000 --listen 127.0.0.1:8787
 
 Then point the client at `http://127.0.0.1:8787/v1/chat/completions`.
 
+### Full debug logging
+
+To see everything that was sent and received (request/response bodies and
+every SSE record and event), log to a file at DEBUG level:
+
+```sh
+python3 proxy.py --upstream http://127.0.0.1:8000 \
+    --listen 127.0.0.1:8787 \
+    --log-level DEBUG --log-file /tmp/proxy.log
+```
+
+The file gets the full DEBUG output; the console then shows only
+WARNING and above.
+
 ## Options
 
 | Flag         | Default | Description                              |
@@ -32,3 +46,5 @@ Then point the client at `http://127.0.0.1:8787/v1/chat/completions`.
 | `--upstream` | `127.0.0.1:8000` | upstream OpenAI-compatible base URL  |
 | `--api-key`  | `TOOLCALL_PROXY_API_KEY` env | bearer token forwarded upstream   |
 | `--timeout`  | `300` | upstream timeout in seconds              |
+| `--log-level`| `INFO` | log verbosity: DEBUG/INFO/WARNING/ERROR/CRITICAL |
+| `--log-file` | — | write the full log to PATH (console then shows WARNING+) |
